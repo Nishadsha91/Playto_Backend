@@ -1,132 +1,229 @@
-# Playto Payout Engine — Design Decisions
-
-> Five choices that make this system safe to move real money.
+# This document explains the five core design decisions I made to ensure this system safely handles financial payouts.
 
 ---
 
-## 1. Balance is never stored — it's always computed
+## System Overview
 
-**The risk:** Saving balance as a column on the merchant record means any failed write or concurrent update can leave it stale or wrong.
+Playto is a payout engine that allows merchants to withdraw funds safely.  
+The system ensures financial correctness through:
 
-Instead, every credit and debit is an immutable row in a `LedgerEntry` table. Balance is the live sum of those rows. Nothing is pre-computed.
+- Ledger-based accounting
+- Database row locking for concurrency safety
+- Idempotency keys for safe retries
+- A strict payout state machine
+- Asynchronous payout processing
 
-**Why this matters:**
-- **No corruption risk** — once a row is written, it's permanent. No partial updates.
-- **Full audit trail** — every balance change has a timestamp and a reason.
-- **Paise, not floats** — all amounts are stored as integers (₹100.01 = 10001 paise). Floating-point rounding errors are structurally impossible.
+---
+
+## 1. The Ledger
+
+**Balance calculation query:**
 
 ```python
+def get_total_balance(self):
+    result = self.ledger_entries.aggregate(total=Sum('amount_paise'))
+    return result['total'] or 0
+
+def get_held_balance(self):
+    result = self.payouts.filter(
+        status__in=[Payout.PENDING, Payout.PROCESSING]
+    ).aggregate(total=Sum('amount_paise'))
+    return result['total'] or 0
+
 def get_available_balance(self):
-    total = self.ledger_entries.aggregate(total=Sum('amount_paise'))['total'] or 0
-    held  = self.payouts.filter(status__in=['pending', 'processing']).aggregate(
-                total=Sum('amount_paise'))['total'] or 0
-    return total - held
+    return self.get_total_balance() - self.get_held_balance()
 ```
+**Why I designed it this way:**
+
+A simple approach would be storing a balance column on the Merchant model.
+However, this approach becomes unsafe when multiple transactions happen concurrently or when a request fails during an update.
+
+To avoid this, I implemented a ledger-based accounting system.
+
+Every credit and debit is stored as an immutable LedgerEntry. The merchant balance is calculated by aggregating those entries instead of storing a single balance value.
+
+This design provides several guarantees:
+
+- **Consistency:** Balance is always derived from the full transaction history.
+- **Auditability:** Every change to the balance is permanently recorded.
+- **Failure safety:** If a transaction fails mid-operation, the ledger still preserves the correct history.
+
+All monetary values are stored as paise (integers) instead of floating-point numbers to avoid precision errors in financial calculations.
+
+Example: ```₹100.01 → 10001 paise```
 
 ---
 
-## 2. Two concurrent requests cannot both drain the same balance
+## 2. The Lock
 
-**The risk:** Two threads both read the balance as ₹1000. Both validate. Both create payouts. You've sent ₹1100 from a ₹1000 account.
-
-Before any balance check, I acquire a `SELECT FOR UPDATE` lock on the merchant row. Any other thread trying to read that row blocks until the first transaction commits.
-
-**Why this matters:**
-- **Validation happens under the lock** — the balance can't change between the check and the write.
-- **All pending payouts are also locked** — a second `process_payout` task can't race the first one.
-- **Why not Python-level checks?** They're inherently racy. By the time Python evaluates your `if`, another thread may have already written.
+**The exact code that prevents overdrawing:**
 
 ```python
-with transaction.atomic():
-    merchant = Merchant.objects.select_for_update().get(id=merchant_id)
-    # balance is now frozen for this transaction
-    if amount_paise > available:
-        raise ValueError("Insufficient balance")
-    Payout.objects.create(...)
+def create_payout(merchant_id, amount_paise, bank_account_id, idempotency_key=''):
+    with transaction.atomic():
+        # This is the lock. Everything after this line is serialised per merchant.
+        merchant = Merchant.objects.select_for_update().get(id=merchant_id)
+
+        # Also lock all pending/processing payouts so their amounts can't change
+        locked_pending = list(
+            Payout.objects.select_for_update().filter(
+                merchant=merchant,
+                status__in=[Payout.PENDING, Payout.PROCESSING],
+            )
+        )
+
+        total_balance = (
+            LedgerEntry.objects
+            .filter(merchant=merchant)
+            .aggregate(total=Sum('amount_paise'))['total'] or 0
+        )
+
+        held_balance = sum(p.amount_paise for p in locked_pending)
+        available = total_balance - held_balance
+
+        if amount_paise > available:
+            raise ValueError(
+                f"Insufficient balance. "
+                f"Available: {available} paise, Requested: {amount_paise} paise."
+            )
+
+        payout = Payout.objects.create(
+            merchant=merchant,
+            bank_account=bank_account,
+            amount_paise=amount_paise,
+            status=Payout.PENDING,
+            idempotency_key=idempotency_key,
+        )
+        return payout
 ```
+
+**The database primitive it relies on:**
+
+`SELECT FOR UPDATE` — a row-level exclusive lock in PostgreSQL. When one transaction holds it, every other transaction trying to acquire the same lock on the same row will block until the first one commits or rolls back.
+
+The reason this has to be a database lock and not a Python-level check is timing. A Python check reads the balance and then, separately, writes the payout. There's a gap between those two operations. In a concurrent system, another request can slip into that gap — it reads the same balance, passes the same check, and creates its own payout. Both go through. You've paid out more than the merchant has.
+
+`select_for_update()` closes that gap. The balance check and the payout creation happen inside a single atomic transaction, and no other process can read or modify the merchant row until that transaction finishes. The validation is never stale.
 
 ---
 
-## 3. A retry is identical from the original request
+## 3. The Idempotency
 
-**The risk:** The server processes a payout but the response is lost. The client retries. Without idempotency, two payouts get created.
+**How the system knows it has seen a key before:**
 
-The client sends a UUID in the `Idempotency-Key` header. The server stores both the key and the full response. If it sees the same key again within 24 hours, it returns the cached response — no new payout is created.
+Each `Idempotency-Key` header value (a UUID sent by the client) is stored in an `IdempotencyKey` table alongside the merchant, the full response body, the HTTP status code, and an expiry 24 hours out. There's a `unique_together` constraint on `(merchant, key)` so the database itself enforces uniqueness.
 
-**Why this matters:**
-- **Key lookup happens first** — before any side effects, so there's no window for a duplicate.
-- **The response is always consistent** — whether the payout is still pending or already completed, the client gets the same original response back.
-- **Scoped per merchant** — keys are unique per merchant, so different merchants can use the same UUID safely.
+When a request arrives with a key, the first thing the view does — before deserializing, before validating, before touching any payout logic — is query this table:
+
+```python
+idempotency_key = request.headers.get('Idempotency-Key', '').strip()
+
+if idempotency_key:
+    cached_body, cached_status = get_idempotency_response(merchant, idempotency_key)
+    if cached_body is not None:
+        return Response(cached_body, status=cached_status)
+```
+
+If there's a match, the cached response goes straight back out. No payout is created. No side effects happen.
+
+After a new payout is successfully created, the response is saved:
 
 ```python
 if idempotency_key:
-    cached = get_idempotency_response(merchant, idempotency_key)
-    if cached:
-        return Response(cached)  # exact same response as the first time
+    save_idempotency_key(merchant, idempotency_key, response_data, response_status_code)
 ```
+
+**What happens if the first request is still in flight when the second arrives:**
+
+The key is saved to the database right after the payout is created — still within the same request cycle, before the response is sent back to the client. So if the network drops the response after the server has finished processing, the key is already stored.
+
+When the client retries, the key lookup finds it immediately and returns the cached response. The retry sees the payout as `PENDING` — which is accurate, because it is. If the payout later completes, the client can poll the payout status endpoint and see `COMPLETED`. The important guarantee is that only one payout was ever created.
+
+The one edge case worth noting: if the server crashes after creating the payout but before saving the idempotency key, the retry would create a second payout. That window is very small, but it exists. A stricter system would save the key and create the payout in the same transaction, using the key as a payout field. I noted this as a known tradeoff.
 
 ---
 
-## 4. Payouts can only move forward, never backward
+## 4. The State Machine
 
-**The risk:** A bug, a retry, or a manual intervention tries to move a completed payout back to pending. Money gets re-sent.
-
-Every status change goes through a `transition_to()` method that validates the move against an allowed-transitions map. Illegal moves raise an exception immediately.
-
-**Why this matters:**
-- **Terminal states are enforced** — `COMPLETED` and `FAILED` cannot transition to anything.
-- **Race conditions surface as errors** — if two tasks both try `PENDING → PROCESSING`, the second one hits the lock, sees `PROCESSING`, and raises. No silent corruption.
+**Where `FAILED → COMPLETED` (and every other illegal transition) is blocked:**
 
 ```python
 VALID_TRANSITIONS = {
-    'pending':    ['processing'],
-    'processing': ['completed', 'failed'],
-    'completed':  [],   # terminal
-    'failed':     [],   # terminal
+    Payout.PENDING:    [Payout.PROCESSING],
+    Payout.PROCESSING: [Payout.COMPLETED, Payout.FAILED],
+    Payout.COMPLETED:  [],
+    Payout.FAILED:     [],
 }
 
 def transition_to(self, new_status):
-    if new_status not in VALID_TRANSITIONS[self.status]:
-        raise ValueError(f"Illegal transition: {self.status} → {new_status}")
+    allowed = self.VALID_TRANSITIONS.get(self.status, [])
+    if new_status not in allowed:
+        raise ValueError(
+            f"Illegal state transition: '{self.status}' → '{new_status}'. "
+            f"Allowed from '{self.status}': {allowed}"
+        )
     self.status = new_status
     self.save(update_fields=['status', 'updated_at'])
 ```
 
----
+`COMPLETED` and `FAILED` map to empty lists. Any call to `transition_to()` from either of those states raises immediately, regardless of what the target state is.
 
-## 5. Catching what an AI assistant got wrong
+This check lives at the model level, not in the view or the task. That means it's enforced no matter what calls it — an API request, a Celery task, a management command, a manual Django shell operation. There's no way to change a payout status that bypasses this.
 
-An AI coding assistant suggested this for calculating merchant balance:
+The task also has a second guard before it even attempts a transition:
 
 ```python
-#  What the AI suggested
-entries = list(LedgerEntry.objects.filter(merchant_id=merchant_id))
-balance = sum(e.amount_paise for e in entries)
+payout = Payout.objects.select_for_update().get(id=payout_id)
+
+if payout.status != Payout.PENDING:
+    logger.info(f"Payout {payout_id} is already '{payout.status}', skipping.")
+    return
 ```
 
-This looks fine at a glance, but has three real problems:
+This handles the case where the same task is queued twice. The `select_for_update()` lock means only one instance runs the check at a time. The second one unblocks, sees a non-PENDING status, and exits cleanly without trying to transition.
 
-1. **Loads every row into memory** — a merchant with 100k transactions fetches 100k objects just to add them up.
-2. **Race condition** — between reading the rows and summing them in Python, another process could create new entries. The total is stale.
-3. **Doesn't scale** — as transaction history grows, every balance check gets slower.
+---
+
+## 5. The AI Audit
+
+**What the AI suggested:**
 
 ```python
-#  What's actually used
+# AI-generated balance calculation
+def get_merchant_balance(merchant_id):
+    entries = list(LedgerEntry.objects.filter(merchant_id=merchant_id))
+    balance = sum(e.amount_paise for e in entries)
+    return balance
+```
+
+This was suggested as the implementation for `get_merchant_balance`. It looks reasonable. It's also wrong in a few ways that matter.
+
+**What I caught:**
+
+First, it loads every ledger entry into Python memory. A merchant who has processed thousands of payouts has thousands of rows. This query fetches all of them, constructs Django model objects for each, and then adds up one field. The database already knows how to sum a column in a single operation — this makes it do the hard work and then throws most of it away.
+
+Second, and more importantly, the sum happens in Python *after* the database read. In a concurrent system, another process could insert a new ledger entry between the `filter()` and the `sum()`. The total you just calculated is already stale. This isn't theoretical — it's exactly the kind of thing that happens under load.
+
+Third, there's no mention of locking. Even if you wrapped this in a transaction, reading all the rows and summing them in Python isn't the same as a database-level aggregate inside a `select_for_update()` block. The isolation guarantees are different.
+
+**What I replaced it with:**
+
+```python
 def get_total_balance(self):
     result = self.ledger_entries.aggregate(total=Sum('amount_paise'))
     return result['total'] or 0
 ```
 
-The database computes the sum in a single query. One row comes back. It's fast, atomic, and works correctly under the `select_for_update()` lock used in payout creation.
+One SQL query. The database returns a single number. When this is called from inside `create_payout()`, it's already executing within the `select_for_update()` transaction, so the read is consistent and no other writer can interfere. It also stays fast regardless of how many ledger entries accumulate — the `(merchant_id, created_at)` index means the database doesn't scan the full table.
+
+The AI-generated implementation calculated balances in Python after fetching all ledger entries. While this works for small datasets, it becomes inefficient and unsafe in production environments.
+
+To solve this, I replaced it with a database aggregation query using `SUM`, which is faster, more scalable, and safer under concurrent transactions.
 
 ---
 
-## Summary
+## Additional Details
 
-| Decision | Mechanism | Guarantee |
-|---|---|---|
-| Ledger-based accounting | Immutable `LedgerEntry` rows, sum on demand | Balance is always accurate; no denormalization drift |
-| Row-level locking | `SELECT FOR UPDATE` inside `transaction.atomic()` | Two concurrent requests cannot overdraft the account |
-| Idempotency keys | UUID per request, response cached for 24h | Retries are safe; only one payout created per request |
-| State machine | `transition_to()` with an allowed-transitions map | Payouts cannot move backward or skip states |
-| Database aggregation | `aggregate(Sum(...))` instead of Python sum | Balance queries are O(log n) and race-condition-free |
+The sections above explain the key architectural decisions behind the payout engine.
+
+For setup instructions, API usage, deployment details, and project structure, please refer to the **README.md** file in the repository.
