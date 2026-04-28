@@ -10,7 +10,6 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
-import os
 from pathlib import Path
 from datetime import timedelta
 from corsheaders.defaults import default_headers
@@ -33,7 +32,7 @@ CSRF_TRUSTED_ORIGINS = [
     "https://playto-backend-5abs.onrender.com"
 ]
 
-CORS_ALLOWED_ORIGINS = [ "http://localhost:5173", "http://127.0.0.1:5173",]
+CORS_ALLOWED_ORIGINS = [ "http://localhost:5173", "http://127.0.0.1:5173", "https://playto-frontend-b2yd.vercel.app/"]
 
 CORS_ALLOW_HEADERS = list(default_headers) + [ "idempotency-key", ]
 
