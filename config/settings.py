@@ -27,9 +27,11 @@ SECRET_KEY = 'django-insecure-7g#)jzor2ch-o2745(gi_(=6nwi^@gc%b71k_f6hnt2$l2x822
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True 
 
-ALLOWED_HOSTS = ["127.0.0.1", "localhost", "0.0.0.0"]
+ALLOWED_HOSTS = ["127.0.0.1", "localhost", "0.0.0.0" , "playto-backend-5abs.onrender.com"]
 
-
+CSRF_TRUSTED_ORIGINS = [
+    "https://playto-backend-5abs.onrender.com"
+]
 
 CORS_ALLOWED_ORIGINS = [ "http://localhost:5173", "http://127.0.0.1:5173",]
 
